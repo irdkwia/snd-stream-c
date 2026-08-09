@@ -3,8 +3,8 @@
  * @author Irdkwia & Adakite
  * @brief SND Stream Library C Edition
  * @details Port of SND Stream Library to C
- * @version 0.8.6
- * @date 2026-02-22
+ * @version 0.9.0
+ * @date 2026-08-09
  */
 #include <pmdsky.h>
 #include <cot.h>
@@ -20,6 +20,10 @@
 extern int HookCheckOverlayArm9;
 extern struct mem_arena* SoundMemoryArenaPtr;
 extern uint16_t ChannelsStruct[];
+
+extern struct dse_voice VoicesStruct[];
+
+int channel_flags = 0;
 
 void SetChannelVolume(int channel, int volume, int unk);
 void SetChannelGlobal(int channel_id, int stype, int16_t* snd_addr, int repeat, int pnt, int len, int volume, int unk, int tmr, int pan);
@@ -88,11 +92,12 @@ struct wave_player {
     int32_t fade_play;
     int32_t old_timer;
     int32_t bgm_id;
-    int8_t channel_start;
+    int8_t channels[2];
+    int8_t tmr;
     int8_t playing;
 };
 
-struct wave_player player[1];
+struct wave_player player[2];
 
 // ******************** Timer Calculation **********************
 int GetTimer(int smplrate) {
@@ -120,23 +125,58 @@ void FreeBuffer(struct wave_player* p) {
 // *************************************************************
 
 // ********************* Channel Setting ***********************
+ 
+int AllocDSESoundChannel() {
+    // TODO: Find how the DSE assigns channels for a sample to play
+    // then use the same mechanism to reserve it
+    for (int i=0; i<16; ++i) {
+        if ((channel_flags&(1<<i)) == 0) {
+            channel_flags |= (1<<i);
+            DseVoice_Deallocate(&(VoicesStruct[i]));
+            return i;
+        }
+    }
+    return -1;
+}
+void AllocChannels(struct wave_player* p) {
+    p->channels[0] = AllocDSESoundChannel();
+    p->channels[1] = AllocDSESoundChannel();
+}
+void FreeDSESoundChannel(int channel_id) {
+    // TODO: Tell the DSE it can use this channel again
+    channel_flags &= ~(1<<channel_id);
+    DseVoice_Deallocate(&(VoicesStruct[channel_id]));
+}
+void FreeChannels(struct wave_player* p) {
+    if (p->channels[0] >= 0) {
+        FreeDSESoundChannel(p->channels[0]);
+        p->channels[0] = -1;
+    }
+    if (p->channels[1] >= 0) {
+        FreeDSESoundChannel(p->channels[1]);
+        p->channels[1] = -1;
+    }
+}
 void SetChannelVolumeQuick(struct wave_player* p) {
-    for (int channel_id=p->channel_start; channel_id<(p->channel_start+2);++channel_id) {
+    for (int i=0; i<2;++i) {
+        int channel_id = p->channels[i];
         SetChannelVolume(1<<channel_id, p->volume, 0);
         ChannelsStruct[26] &= ~(1<<channel_id);
     }
 }
 void SetChannelQuick(struct wave_player* p) {
-    for (int channel_id=p->channel_start; channel_id<(p->channel_start+2);++channel_id) {
+    for (int i=0; i<2;++i) {
+        int channel_id = p->channels[i];
         ChannelsStruct[25] |= (1<<channel_id);
         ChannelsStruct[27] &= ~(1<<channel_id);
-        struct wave_file_streamer* wfs = (channel_id==p->channel_start)?&(p->wave_stream_right):&(p->wave_stream_left);
-        int snd_pan = (channel_id==p->channel_start)?0x7F:0;
+        struct wave_file_streamer* wfs = (i==0)?&(p->wave_stream_right):&(p->wave_stream_left);
+        int snd_pan = (i==0)?0x7F:0;
         SetChannelGlobal(channel_id, 1, wfs->adpcm_decoder.ptr_pcm, 1, 0, wfs->adpcm_decoder.pcm_buf_len>>2, p->volume, 0, GetTimer(wfs->smplrate), snd_pan);
     }
 }
 void ResetChannelQuick(struct wave_player* p) {
-    for (int channel_id=p->channel_start; channel_id<(p->channel_start+2);++channel_id) {
+    for (int i=0; i<2;++i) {
+        int channel_id = p->channels[i];
         ChannelsStruct[25] &= ~(1<<channel_id);
         ChannelsStruct[26] |= (1<<channel_id);
         ChannelsStruct[27] |= (1<<channel_id);
@@ -344,18 +384,19 @@ int LoadSamples(struct wave_file_streamer* wfs, int nb_samples) {
 void StopSound(struct wave_player* p) {
     p->playing = 0;
     __asm__ __volatile__("":::"memory");
-    TMR2[0] = 0;
+    TMR2[p->tmr] = 0;
     __asm__ __volatile__("":::"memory");
     ResetChannelQuick(p);
     CloseWaveFileStream(&(p->wave_stream_left));
     CloseWaveFileStream(&(p->wave_stream_right));
+    FreeChannels(p);
     FreeBuffer(p);
 }
 
 void StartSound(struct wave_player* p) {
     StopSound(p);
     AllocBuffer(p);
-    p->channel_start = CHANNEL_RANGE_START;
+    AllocChannels(p);
     char filename[64];
     sprintf(filename, "SOUND/BGM/bgm%04d_left.wav", p->bgm_id);
     OpenWaveFileStream(&(p->wave_stream_left), filename);
@@ -373,7 +414,7 @@ void StartSound(struct wave_player* p) {
     p->old_timer = 0;
     p->timer = 0;
         __asm__ __volatile__("":::"memory");
-    TMR2[0] = 0x830000;
+    TMR2[p->tmr] = 0x830000;
         __asm__ __volatile__("":::"memory");
     p->playing = 1;
 }
@@ -394,7 +435,7 @@ int HandleFading(struct wave_player* p) {
 }
 void HandleSoundProcess(struct wave_player* p) {
     __asm__ __volatile__("":::"memory");
-    int tmr = TMR2[0];
+    int tmr = TMR2[p->tmr];
         __asm__ __volatile__("":::"memory");
     tmr &= 0xFFFF;
     int elapsed = (uint16_t)(tmr - p->old_timer);
@@ -428,6 +469,13 @@ __attribute__((used)) void SNDStream_StartBGM(int player_id, int bgm_id, int fad
     if (HookCheckOverlayArm9 != (int)HookSetMusicInfo) {
         HookCheckOverlayArm9 = (int)HookSetMusicInfo;
         player[0].bgm_id = -1;
+        player[1].bgm_id = -1;
+        player[0].tmr = 0;
+        player[1].tmr = 1;
+        player[0].channels[0] = -1;
+        player[0].channels[1] = -1;
+        player[1].channels[0] = -1;
+        player[1].channels[1] = -1;
     }
     struct wave_player* p = player+player_id;
     if (p->bgm_id == bgm_id) return;
@@ -481,38 +529,83 @@ __attribute__((naked)) void HookSetMusicInfo() {
     asm volatile("stmdb r13!,{r0-r12}");
     asm volatile("mov r0,#0");
     asm volatile("bl SNDStream_SetMusicInfo");
+    asm volatile("mov r0,#1");
+    asm volatile("bl SNDStream_SetMusicInfo");
     asm volatile("ldmia r13!,{r0-r12}");
     asm volatile("b EndHookSoundProcess");
 }
 
 __attribute__((naked)) void HookStartBGM() {
-    asm volatile("stmdb r13!,{r0-r12}");
+    asm volatile("bl FunctionUnk1");
     asm volatile("mov r0,#0");
     asm volatile("mov r1,r6");
     asm volatile("mov r2,r5");
     asm volatile("mov r3,r4");
     asm volatile("bl SNDStream_StartBGM");
-    asm volatile("ldmia r13!,{r0-r12}");
-    asm volatile("bl FunctionUnk1");
     asm volatile("b EndHookStartBGM");
 }
 __attribute__((naked)) void HookStopBGM() {
     asm volatile("mov r4,r0");
-    asm volatile("stmdb r13!,{r0-r12}");
     asm volatile("mov r0,#0");
     asm volatile("mov r1,r4");
     asm volatile("bl SNDStream_StopBGM");
-    asm volatile("ldmia r13!,{r0-r12}");
     asm volatile("b EndHookStopBGM");
 }
 __attribute__((naked)) void HookChangeBGM() {
     asm volatile("bl FunctionUnk1");
-    asm volatile("stmdb r13!,{r0-r12}");
     asm volatile("mov r0,#0");
     asm volatile("mov r1,r5");
     asm volatile("mov r2,r4");
     asm volatile("bl SNDStream_ChangeBGM");
-    asm volatile("ldmia r13!,{r0-r12}");
     asm volatile("b EndHookChangeBGM");
+}
+
+__attribute__((naked)) void HookStart2BGM() {
+    asm volatile("bl FunctionUnk1");
+    asm volatile("mov r0,#1");
+    asm volatile("mov r1,r6");
+    asm volatile("mov r2,r5");
+    asm volatile("mov r3,r4");
+    asm volatile("bl SNDStream_StartBGM");
+    asm volatile("b EndHookStart2BGM");
+}
+__attribute__((naked)) void HookStop2BGM() {
+    asm volatile("mov r4,r0");
+    asm volatile("mov r0,#1");
+    asm volatile("mov r1,r4");
+    asm volatile("bl SNDStream_StopBGM");
+    asm volatile("b EndHookStop2BGM");
+}
+__attribute__((naked)) void HookChange2BGM() {
+    asm volatile("bl FunctionUnk1");
+    asm volatile("mov r0,#1");
+    asm volatile("mov r1,r5");
+    asm volatile("mov r2,r4");
+    asm volatile("bl SNDStream_ChangeBGM");
+    asm volatile("b EndHookChange2BGM");
+}
+
+__attribute__((naked)) void HookDSEVoiceAllocate() {
+    asm volatile("stmdb r13!,{r4,r5}");
+    asm volatile("ldr r4,=channel_flags");
+    asm volatile("ldr r4,[r4]");
+    asm volatile("mov r5,#1");
+    asm volatile("tst r4,r5,lsl r12");
+    asm volatile("ldmia r13!,{r4,r5}");
+    asm volatile("bne EndHookDSEVoiceAllocateSkip");
+    asm volatile("ldr r9,[r3, #+0x0]");
+    asm volatile("b EndHookDSEVoiceAllocate");
+}
+
+__attribute__((naked)) void HookDSEVoiceAllocate2() {
+    asm volatile("stmdb r13!,{r4,r5}");
+    asm volatile("ldr r4,=channel_flags");
+    asm volatile("ldr r4,[r4]");
+    asm volatile("mov r5,#1");
+    asm volatile("tst r4,r5,lsl r7");
+    asm volatile("ldmia r13!,{r4,r5}");
+    asm volatile("bne EndHookDSEVoiceAllocateSkip2");
+    asm volatile("ldr r0,[r1, #+0x888]");
+    asm volatile("b EndHookDSEVoiceAllocate2");
 }
 // *************************************************************
